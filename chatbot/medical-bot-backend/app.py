@@ -244,14 +244,14 @@ def get_conversational_chain():
         (Generate a structured response following the guidelines.)
     """
 
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.5, google_api_key=GOOGLE_API_KEY)
+    model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.5, google_api_key=GOOGLE_API_KEY)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "user_history", "question"])
     chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
     return chain
 
 # General conversational response
 def get_general_response(user_message, user_history):
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.7, google_api_key=GOOGLE_API_KEY)
+    model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.7, google_api_key=GOOGLE_API_KEY)
     if "hi" in user_message.lower() or "hello" in user_message.lower():
         return "Hello! I'm your medical assistant. How can I help you with your health today?"
     elif "name" in user_message.lower() and "?" in user_message:
@@ -266,7 +266,7 @@ def get_general_response(user_message, user_history):
 
 # Food Analysis Prompt
 def analyze_food_with_health_and_knowledge(food_label, confidence, user_history, context, input_documents=None):
-    food_analysis_model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.3, google_api_key=GOOGLE_API_KEY)
+    food_analysis_model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3, google_api_key=GOOGLE_API_KEY)
     prompt_template = """
         You are a dietary chatbot assisting a user. Analyze the suitability of the identified food based on the user's health profile and available food-related knowledge. Provide a conversational, structured response limited to 150-200 words.
         do not answer in more elabrate. give the answer for the question ** behave like a chatbot. **
@@ -456,6 +456,7 @@ def admin_login():
         return jsonify({"error": "Failed to log in. Please try again later."}), 500
 
 # Admin route for uploading PDFs
+# Admin route for uploading PDFs
 @app.route('/api/upload', methods=['POST'])
 @token_required
 def admin_upload():
@@ -474,7 +475,8 @@ def admin_upload():
             collection = request.form.get('collection', 'Admin')  # Default to Admin if not specified
             if collection not in ['Admin', 'food_analyse']:
                 return jsonify({'error': 'Invalid collection. Use "Admin" or "food_analyse"'}), 400
-            result = process_admin_pdf(file, collection)
+            # Pass the weaviate_client to process_admin_pdf
+            result = process_admin_pdf(file, collection, weaviate_client=weaviate_client)
             return jsonify({'message': result})
         else:
             return jsonify({'error': 'Unsupported file type. Upload a PDF file'}), 400
@@ -660,9 +662,11 @@ def set_profile():
             return_document=True
         )
 
+        # Inside the set_profile route, replace the Weaviate data storage logic
         if weaviate_client:
             class_name, exists = create_user_schema(weaviate_client, user_id)
             try:
+                # Delete existing objects if the class already exists
                 if exists:
                     result = weaviate_client.data_object.get(class_name=class_name)
                     if result and 'objects' in result:
@@ -672,15 +676,27 @@ def set_profile():
                                 class_name=class_name
                             )
                         logger.info(f"Deleted existing objects in Weaviate class: {class_name}")
+
+                # Format and chunk user profile data
                 formatted_data = format_user_profile(updated_user)
                 logger.info(f"Formatted user profile for Weaviate: {formatted_data}")
                 chunks = chunk_text(formatted_data, chunk_size=500)
                 embeddings_list = embeddings.embed_documents(chunks)
-                weaviate_client.data_object.create_many(
-                    [{"text": chunk, "vector": embedding} for chunk, embedding in zip(chunks, embeddings_list)],
-                    class_name=class_name
-                )
+
+                # Use the batch API to insert data
+                with weaviate_client.batch as batch:
+                    batch.batch_size = 100  # Adjust batch size if needed
+                    for chunk, embedding in zip(chunks, embeddings_list):
+                        batch.add_data_object(
+                            data_object={"content": chunk},  # Match the schema property name
+                            class_name=class_name,
+                            vector=embedding
+                        )
                 logger.info(f"Stored/Updated user data in Weaviate class: {class_name}")
+
+                # Verify the data was stored
+                count = weaviate_client.query.aggregate(class_name).with_meta_count().do().get("data", {}).get("Aggregate", {}).get(class_name, [{}])[0].get("meta", {}).get("count", 0)
+                logger.info(f"Total objects in {class_name} after insertion: {count}")
             except Exception as e:
                 logger.error(f"Error storing/updating data in Weaviate: {str(e)}")
 
@@ -803,7 +819,7 @@ def upload_image():
 
         if file and (file.filename.endswith('.jpg') or file.filename.endswith('.jpeg')):
             # Load the SavedModel using TFSMLayer
-            model_path = "D:/Users 2.o/PY charm/flask/chatbot/medical-bot-backend/model/final_v1_xception_savedmodel"
+            model_path = "D:/Users 2.o/PY charm/flask/Health-assistant/chatbot/medical-bot-backend/model/final_v1_xception_savedmodel"
             model = TFSMLayer(model_path, call_endpoint='serving_default')
             logger.info("Model loaded successfully.")
 

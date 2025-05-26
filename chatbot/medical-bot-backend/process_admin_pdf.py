@@ -14,22 +14,7 @@ logger.info("Loading process_admin_pdf.py - This is the updated version")
 
 # Load environment variables
 load_dotenv()
-WEAVIATE_URL = os.getenv("WEAVIATE_URL")
-WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-# Initialize Weaviate Client
-try:
-    client = weaviate.Client(
-        url=WEAVIATE_URL,
-        auth_client_secret=weaviate.auth.AuthApiKey(api_key=WEAVIATE_API_KEY),
-        timeout_config=(10, 60)  # 10s connection, 60s read
-    )
-    client.get_meta()
-    logger.info("Successfully connected to Weaviate Cloud")
-except Exception as e:
-    logger.error(f"Failed to initialize Weaviate client: {str(e)}")
-    raise
 
 # Configure Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
@@ -97,8 +82,11 @@ def generate_embeddings(chunks, max_retries=3):
     return embeddings
 
 # Step 4: Upload to Weaviate
-def upload_to_weaviate(chunks, embeddings, collection_name="Admin", max_retries=3):
+def upload_to_weaviate(chunks, embeddings, collection_name="Admin", client=None, max_retries=3):
     """Upload chunks and embeddings to the specified Weaviate collection with retries."""
+    if not client:
+        raise ValueError("Weaviate client must be provided")
+
     try:
         logger.info(f"Starting upload to Weaviate collection: {collection_name}")
         schema_name = collection_name.capitalize()
@@ -107,61 +95,74 @@ def upload_to_weaviate(chunks, embeddings, collection_name="Admin", max_retries=
             "vectorizer": "none",
             "properties": [{"name": "text", "dataType": ["text"]}]
         }
-        if not client.schema.exists(schema_name):
-            client.schema.create_class(schema)
-            logger.info(f"Created Weaviate class: {schema_name}")
-        else:
-            logger.info(f"Class {schema_name} already exists")
+        # Check if the class exists with retry logic
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                if not client.schema.exists(schema_name):
+                    client.schema.create_class(schema)
+                    logger.info(f"Created Weaviate class: {schema_name}")
+                else:
+                    logger.info(f"Class {schema_name} already exists")
+                break
+            except Exception as e:
+                attempt += 1
+                logger.error(f"Attempt {attempt}/{max_retries} failed to check/create class {schema_name}: {str(e)}")
+                if attempt == max_retries:
+                    raise
+                time.sleep(2 ** attempt)
 
         # Safely handle object deletion
-        try:
-            result = client.data_object.get(class_name=schema_name)
-            logger.debug(f"Get objects response: {result}")
-            if result and isinstance(result, dict) and 'objects' in result and result['objects']:
-                for obj in result['objects']:
-                    if '_additional' in obj and 'id' in obj['_additional']:
-                        client.data_object.delete(uuid=obj['_additional']['id'], class_name=schema_name)
-                        logger.info(f"Deleted object with ID: {obj['_additional']['id']}")
-                    else:
-                        logger.warning(f"Object missing '_additional' or 'id': {obj}")
-            else:
-                logger.info("No existing objects to delete or invalid response")
-        except Exception as e:
-            logger.error(f"Error deleting existing objects: {str(e)} - Skipping deletion")
-            pass  # Skip deletion if it fails to avoid breaking the process
-
-        # Upload chunks with embeddings
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            attempt = 0
-            while attempt < max_retries:
-                try:
-                    logger.debug(f"Attempt {attempt + 1}/{max_retries}: Uploading chunk {i + 1}/{len(chunks)}")
-                    cleaned_chunk = chunk.encode('utf-8', 'replace').decode('utf-8')
-                    data_object = {
-                        "text": cleaned_chunk,
-                        "vector": embedding
-                    }
-                    logger.debug(f"Data object for chunk {i + 1}: {data_object}")
-                    client.data_object.create(
-                        data_object=data_object,
-                        class_name=schema_name
-                    )
-                    logger.debug(f"Successfully uploaded chunk {i + 1}/{len(chunks)}")
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                result = client.data_object.get(class_name=schema_name)
+                logger.debug(f"Get objects response: {result}")
+                if result and isinstance(result, dict) and 'objects' in result and result['objects']:
+                    for obj in result['objects']:
+                        if '_additional' in obj and 'id' in obj['_additional']:
+                            client.data_object.delete(uuid=obj['_additional']['id'], class_name=schema_name)
+                            logger.info(f"Deleted object with ID: {obj['_additional']['id']}")
+                        else:
+                            logger.warning(f"Object missing '_additional' or 'id': {obj}")
+                else:
+                    logger.info("No existing objects to delete or invalid response")
+                break
+            except Exception as e:
+                attempt += 1
+                logger.error(f"Attempt {attempt}/{max_retries} failed to delete objects: {str(e)}")
+                if attempt == max_retries:
+                    logger.warning("Skipping deletion due to persistent errors")
                     break
+                time.sleep(2 ** attempt)
+
+        # Upload chunks with embeddings using batch API
+        with client.batch as batch:
+            batch.batch_size = 100  # Adjust batch size if needed
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                try:
+                    logger.debug(f"Uploading chunk {i + 1}/{len(chunks)}")
+                    cleaned_chunk = chunk.encode('utf-8', 'replace').decode('utf-8')
+                    batch.add_data_object(
+                        data_object={"text": cleaned_chunk},
+                        class_name=schema_name,
+                        vector=embedding
+                    )
+                    logger.debug(f"Successfully queued chunk {i + 1}/{len(chunks)} for upload")
                 except Exception as e:
-                    attempt += 1
-                    logger.error(f"Attempt {attempt}/{max_retries} failed for chunk {i + 1}: {str(e)} - Full exception: {repr(e)}")
-                    if attempt == max_retries:
-                        raise
-                    time.sleep(2 ** attempt)
+                    logger.error(f"Failed to queue chunk {i + 1}/{len(chunks)}: {str(e)}")
+                    raise
         logger.info(f"Total number of chunks uploaded to {schema_name}: {len(chunks)}")
     except Exception as e:
         logger.error(f"Error uploading to Weaviate: {str(e)} - Full exception: {repr(e)}")
         raise
 
 # Step 5: Count objects in the specified collection
-def count_objects_in_collection(collection_name="Admin"):
+def count_objects_in_collection(collection_name="Admin", client=None):
     """Count the number of objects in the specified Weaviate collection."""
+    if not client:
+        raise ValueError("Weaviate client must be provided")
+
     try:
         schema_name = collection_name.capitalize()
         response = client.query.aggregate(schema_name).with_meta_count().do()
@@ -173,15 +174,15 @@ def count_objects_in_collection(collection_name="Admin"):
         return 0
 
 # Main function to process admin PDF
-def process_admin_pdf(file, collection):
-    """Process a PDF file and optionally upload to Weaviate."""
+def process_admin_pdf(file, collection, weaviate_client=None):
+    """Process a PDF file and upload to Weaviate using the provided client."""
     try:
         text = extract_text_from_pdf(file)
         logger.debug(f"Final extracted text (first 100 chars): {repr(text[:100])}...")
         chunks = chunk_text(text)
         embeddings = generate_embeddings(chunks)
-        upload_to_weaviate(chunks, embeddings, collection)
-        count = count_objects_in_collection(collection)
+        upload_to_weaviate(chunks, embeddings, collection, client=weaviate_client)
+        count = count_objects_in_collection(collection, client=weaviate_client)
         return f"Successfully processed PDF for collection {collection}. Extracted text length: {len(text)} characters. Uploaded {count} objects."
     except ValueError as e:
         logger.error(f"Error processing admin PDF: {str(e)}")
